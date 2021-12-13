@@ -1,65 +1,145 @@
-import pytest
-import tempfile
+"""config class"""
 
-from utils.testutils import sampleConfig
-from config.config import *
+import logging
+import os
+import yaml
 
-def sampleConfigList():
-    return [
-        "-host=127.0.0.1",
-        "-port=1521",
-        "-database=exampleDatabase",
-        "-user=exampleUser",
-        "-password=examplePassword",
-        "-connOpts=sslmode=disable",
-    ]
+from utils.utils import setIfExists
 
-class TestConfig:
-    @pytest.fixture
-    def sample(self):
-        return sampleConfig()
+from .errors.malformedFlag import malformedFlag
+from .errors.malformedConnOpts import malformedConnOpts
+from .errors.nonExistantFlag import nonExistantFlag
+from .errors.missingFlags import missingFlags
 
-    def test_Init(self, sample):
-        assert sample.host == "127.0.0.1"
-        assert sample.port == "1521"
-        assert sample.database == "exampleDatabase"
-        assert sample.user == "exampleUser"
-        assert sample.password == "examplePassword"
-        assert sample.connOpts == "sslmode=disable"
+class config:
+    flags = ["config-file", "host", "port", "database", "user", "password", "connOpts", "dev"]
 
-    def test_checkMissingFlagsNoRaiseMissingFlags(self, sample):
-        C = sample.C
-        try:
-            config.checkMissingFlags(C)
-        except missingFlags:
-            assert False, "Should not have raised the missingFlags exception"
+    requiredFlags = ["host", "port", "database", "user", "password"]
 
-    def test_checkMissingFlagsRaisesMissingFlags(self, sample):
-        C = sample.C
-        C.pop("host") # Remove required flag, should raise an exception
-        with pytest.raises(missingFlags):
-            config.checkMissingFlags(C)
+    def __init__(self, configArg):
+        self.C = {}
 
-    def test_cliOverridesFile(self):
-        tempFile = tempfile.NamedTemporaryFile(mode='w+t', prefix="sales-platform-configTest_",
-            suffix=".yaml")
-        tempFile.write(
-"""
-host: hostFromFile
-database: databaseFromFile
-user: userFromFile
-password: passwordFromFile
-"""
-        )
-        tempFile.close()
+        self.host = ""
+        self.port = ""
+        self.database = ""
+        self.user = ""
+        self.password = ""
+        self.connOpts = ""
 
-        cliArgs = sampleConfigList()
-        allArgs = cliArgs
-        list.append(allArgs, "-config-file={}".format(tempFile.name))
-        cfg = config(allArgs)
+        self.dev = ""
 
-        expectedC = config.parseList(allArgs)
-        actualC = cfg.C
-        # Assert that none of the CLI arguments were overriden by file config
-        for k in expectedC.keys():
-            assert expectedC[k] == actualC[k]
+        # Parse from yaml file
+        self.C = self.update(self.C, config.parseFile(configArg))
+        
+        # Parse from list of arguments
+        self.C = self.update(self.C, config.parseList(configArg))
+
+        config.checkMissingFlags(self.C)
+
+    # The argument list is given in the form '-flag=value'
+    def parseList(arglist):
+        C = {}
+
+        for arg in arglist:
+            if len(arg) > 0 and arg[0] == '-':
+                arg = arg[1:]
+
+                flagValue = arg.split("=")
+
+                if len(flagValue) < 2:
+                    raise malformedFlag(arg)
+
+                flag = flagValue[0]
+                value = "=".join(flagValue[1:])
+
+                if flag not in config.flags:
+                    raise nonExistantFlag(arg)
+                if value == "":
+                    raise malformedFlag(arg)
+
+                # Build C piece by piece
+                C[flag] = value
+        return C
+
+    def parseFile(configArg):
+        configFile = "config.yaml"
+        parsedList = config.parseList(configArg)
+        configFile = setIfExists(configFile, parsedList, "config-file")
+
+        if os.path.isfile(configFile):
+            C = None
+            with open(configFile) as f:
+                C = yaml.load(f, Loader=yaml.FullLoader)
+
+            return C
+
+        logging.warning("Config file not found")
+        return {}
+
+    def update(self, old, new):
+        definitive = old
+        for k in new.keys():
+            definitive[k] = new[k]
+
+        self.setConfig(definitive)
+
+        return definitive
+
+    def setConfig(self, C):
+        self.host = setIfExists(self.host, C, "host")
+        self.port = setIfExists(self.port, C, "port")
+        self.database = setIfExists(self.database, C, "database")
+        self.user = setIfExists(self.user, C, "user")
+        self.password = setIfExists(self.password, C, "password")
+        self.connOpts = setIfExists(self.connOpts, C, "connOpts")
+        
+        self.dev = setIfExists(self.dev, C, "dev")
+
+    def checkMissingFlags(C):
+        # Build a message containing all missing flags
+        missingFlagsMessage = ""
+
+        ckeys = C.keys()
+        for flag in config.requiredFlags:
+            if flag not in ckeys:
+                missingFlagsMessage += flag + ","
+        
+        if missingFlagsMessage != "":
+            # Disconsider last comma
+            missingFlagsMessage = missingFlagsMessage[:-1]
+            raise missingFlags(missingFlagsMessage)
+
+    # Parse connection options on the format 'opt1=val1,opt2=val2,...' to a map.
+    def parseConnOptsMap(connOpts):
+        M = {}
+        flagValues = connOpts.split(",")
+        for i in range(len(flagValues)):
+            flagValue = flagValues[i].split("=")
+
+            if len(flagValue) != 2:
+                raise malformedConnOpts(connOpts)
+            
+            flag = flagValue[0]
+            val = flagValue[1]
+
+            M[flag] = val
+
+    # Parse connection options to the format "opt1=val1 opt2=val2 ..."
+    def parseConnOptsSpaces(connOpts):
+        return connOpts.replace(",", " ")
+
+    # Parse connection options to the format "?opt1=val1&opt2=val2&..."
+    def parseConnOptsUrl(connOpts):
+        parsedConnOpts = ""
+
+        M = config.parseConnOptsMap(connOpts)
+        mkeys = list(M.keys())
+        for i in range(len(mkeys)):
+            if i == 0:
+                parsedConnOpts += "?"
+            else:
+                parsedConnOpts += "&"
+            
+            parsedConnOpts += M[mkeys[i]]
+
+        return parsedConnOpts
